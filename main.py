@@ -73,6 +73,9 @@ fernet = Fernet(settings.encryption_key.encode())
 
 redis_client = redis.from_url(settings.redis_url, decode_responses=True)
 
+# Global database pool - will be initialized on startup
+db_pool: Optional[asyncpg.Pool] = None
+
 celery_app = Celery(
     "cellular_empire",
     broker=settings.celery_broker_url,
@@ -81,20 +84,20 @@ celery_app = Celery(
 
 celery_app.conf.beat_schedule = {
     "metabolism-every-30s": {
-        "task": "tasks.process_metabolism",
-        "schedule": settings.metabolism_interval,
+        "task": "main.process_metabolism",
+        "schedule": timedelta(seconds=settings.metabolism_interval),
     },
     "global-events-weekly": {
-        "task": "tasks.trigger_global_event",
-        "schedule": settings.global_event_interval,
+        "task": "main.trigger_global_event",
+        "schedule": timedelta(seconds=settings.global_event_interval),
     },
     "backup-every-6h": {
-        "task": "tasks.backup_database",
-        "schedule": settings.backup_interval,
+        "task": "main.backup_database",
+        "schedule": timedelta(seconds=settings.backup_interval),
     },
 }
 
- REQUESTS_COUNT = Counter("bot_requests_total", "Total requests")
+REQUESTS_COUNT = Counter("bot_requests_total", "Total requests")
 ACTIVE_PLAYERS = Gauge("active_players", "Active players")
 COLONY_SIZE = Histogram("colony_size_cells", "Colony size in cells")
 
@@ -257,11 +260,15 @@ def select_random_gene(slot: str) -> Gene:
 
 
 async def get_db_pool() -> asyncpg.Pool:
-    return await asyncpg.create_pool(
-        settings.database_url,
-        min_size=settings.db_pool_min,
-        max_size=settings.db_pool_max,
-    )
+    """Get or create the global database pool."""
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(
+            settings.database_url,
+            min_size=settings.db_pool_min,
+            max_size=settings.db_pool_max,
+        )
+    return db_pool
 
 
 @celery_app.task
@@ -270,54 +277,69 @@ def process_metabolism():
 
 
 async def _process_metabolism_async():
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            colonies = await conn.fetch("""
-                SELECT id, cell_count, energy, biomass, organelles, environment, pandemic_resistance
-                FROM colonies
-                WHERE last_calc_at < NOW() - INTERVAL '30 seconds'
-            """)
-            
-            for colony in colonies:
-                cell_count = colony["cell_count"]
-                energy = Decimal(colony["energy"])
-                organelles = json.loads(colony["organelles"] or "{}")
-                environment = colony["environment"] or "ocean"
+    """Process metabolism for all colonies."""
+    pool = None
+    try:
+        pool = await asyncpg.create_pool(
+            settings.database_url,
+            min_size=settings.db_pool_min,
+            max_size=settings.db_pool_max,
+        )
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                colonies = await conn.fetch("""
+                    SELECT id, cell_count, energy, biomass, organelles, environment, pandemic_resistance
+                    FROM colonies
+                    WHERE last_calc_at < NOW() - INTERVAL '30 seconds'
+                """)
                 
-                sun_factor = 1.0 if environment in ["surface", "shallow"] else 0.3
-                mineral_factor = 1.0 if environment in ["deep", "volcanic"] else 0.5
-                
-                photosynthesis = organelles.get("photosynthesis", 0) * 0.1 * sun_factor
-                chemosynthesis = organelles.get("chemosynthesis", 0) * 0.05 * mineral_factor
-                base_metabolism = cell_count * 0.01
-                organelle_upkeep = sum(organelles.values()) * 0.02
-                
-                delta_e = Decimal(photosynthesis + chemosynthesis - base_metabolism - organelle_upkeep)
-                new_energy = max(Decimal(0), energy + delta_e)
-                
-                if new_energy < 0.1 * cell_count:
-                    cell_loss = int(cell_count * 0.1)
-                    new_cell_count = max(1, cell_count - cell_loss)
-                    await conn.execute("""
-                        UPDATE colonies 
-                        SET cell_count = $1, energy = $2, last_calc_at = NOW()
-                        WHERE id = $3
-                    """, new_cell_count, new_energy, colony["id"])
-                else:
-                    new_cell_count = cell_count
-                    await conn.execute("""
-                        UPDATE colonies 
-                        SET energy = $1, last_calc_at = NOW()
-                        WHERE id = $2
-                    """, new_energy, colony["id"])
-                
-                phase = get_phase_by_cell_count(new_cell_count)
-                await conn.execute("""
-                    UPDATE players SET current_phase = $1 WHERE id = (
-                        SELECT player_id FROM colonies WHERE id = $2
-                    )
-                """, phase, colony["id"])
+                for colony in colonies:
+                    try:
+                        cell_count = colony["cell_count"]
+                        energy = Decimal(colony["energy"])
+                        organelles = json.loads(colony["organelles"] or "{}")
+                        environment = colony["environment"] or "ocean"
+                        
+                        sun_factor = Decimal("1.0") if environment in ["surface", "shallow"] else Decimal("0.3")
+                        mineral_factor = Decimal("1.0") if environment in ["deep", "volcanic"] else Decimal("0.5")
+                        
+                        photosynthesis = Decimal(str(organelles.get("photosynthesis", 0))) * Decimal("0.1") * sun_factor
+                        chemosynthesis = Decimal(str(organelles.get("chemosynthesis", 0))) * Decimal("0.05") * mineral_factor
+                        base_metabolism = Decimal(str(cell_count)) * Decimal("0.01")
+                        organelle_upkeep = Decimal(str(sum(organelles.values()))) * Decimal("0.02")
+                        
+                        delta_e = photosynthesis + chemosynthesis - base_metabolism - organelle_upkeep
+                        new_energy = max(Decimal(0), energy + delta_e)
+                        
+                        if new_energy < Decimal("0.1") * Decimal(str(cell_count)):
+                            cell_loss = int(cell_count * 0.1)
+                            new_cell_count = max(1, cell_count - cell_loss)
+                            await conn.execute("""
+                                UPDATE colonies 
+                                SET cell_count = $1, energy = $2, last_calc_at = NOW()
+                                WHERE id = $3
+                            """, new_cell_count, new_energy, colony["id"])
+                        else:
+                            new_cell_count = cell_count
+                            await conn.execute("""
+                                UPDATE colonies 
+                                SET energy = $1, last_calc_at = NOW()
+                                WHERE id = $2
+                            """, new_energy, colony["id"])
+                        
+                        phase = get_phase_by_cell_count(new_cell_count)
+                        await conn.execute("""
+                            UPDATE players SET current_phase = $1 WHERE id = (
+                                SELECT player_id FROM colonies WHERE id = $2
+                            )
+                        """, phase.value, colony["id"])
+                    except Exception as e:
+                        logger.error(f"Error processing colony {colony['id']}: {e}")
+    except Exception as e:
+        logger.error(f"Error in metabolism processing: {e}")
+    finally:
+        if pool is not None:
+            await pool.close()
 
 
 @celery_app.task
@@ -326,31 +348,44 @@ def trigger_global_event():
 
 
 async def _trigger_global_event_async():
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        event_type = random.choice([EventType.VIRUS, EventType.ICE_AGE, EventType.RADIATION])
-        severity = random.random()
-        
-        await conn.execute("""
-            INSERT INTO events (type, target_colony_id, params, expires_at)
-            SELECT $1, id, $2, NOW() + INTERVAL '24 hours'
-            FROM colonies
-            WHERE random() < $3
-        """, event_type, json.dumps({"severity": severity}), 0.3)
-        
-        if event_type == EventType.VIRUS:
+    """Trigger a global event affecting random colonies."""
+    pool = None
+    try:
+        pool = await asyncpg.create_pool(
+            settings.database_url,
+            min_size=settings.db_pool_min,
+            max_size=settings.db_pool_max,
+        )
+        async with pool.acquire() as conn:
+            event_type = random.choice([EventType.VIRUS, EventType.ICE_AGE, EventType.RADIATION])
+            severity = random.random()
+            
             await conn.execute("""
-                UPDATE colonies 
-                SET cell_count = GREATEST(1, cell_count * (1 - $1 * (1 - pandemic_resistance)))
-                WHERE id IN (SELECT target_colony_id FROM events WHERE type = $2)
-            """, severity, event_type)
-        elif event_type == EventType.RADIATION:
-            await conn.execute("""
-                UPDATE colonies 
-                SET mutation_tree = mutation_tree || jsonb_build_object('radiation_mutations', 
-                    (mutation_tree->>'radiation_mutations' OR '0')::int + 1)
-                WHERE id IN (SELECT target_colony_id FROM events WHERE type = $2)
-            """, event_type)
+                INSERT INTO events (type, target_colony_id, params, expires_at)
+                SELECT $1, id, $2, NOW() + INTERVAL '24 hours'
+                FROM colonies
+                WHERE random() < $3
+            """, event_type.value, json.dumps({"severity": severity}), 0.3)
+            
+            if event_type == EventType.VIRUS:
+                await conn.execute("""
+                    UPDATE colonies 
+                    SET cell_count = GREATEST(1, cell_count * (1 - $1 * (1 - pandemic_resistance)))
+                    WHERE id IN (SELECT target_colony_id FROM events WHERE type = $2)
+                """, severity, event_type.value)
+            elif event_type == EventType.RADIATION:
+                await conn.execute("""
+                    UPDATE colonies 
+                    SET mutation_tree = mutation_tree || jsonb_build_object('radiation_mutations', 
+                        (mutation_tree->>'radiation_mutations' OR '0')::int + 1)
+                    WHERE id IN (SELECT target_colony_id FROM events WHERE type = $2)
+                """, event_type.value)
+            logger.info(f"Triggered global event: {event_type.value} with severity {severity}")
+    except Exception as e:
+        logger.error(f"Error triggering global event: {e}")
+    finally:
+        if pool is not None:
+            await pool.close()
 
 
 @celery_app.task
@@ -359,111 +394,189 @@ def backup_database():
 
 
 async def check_rate_limit(telegram_id: int) -> bool:
+    """Check rate limit for a user using atomic Redis operation."""
     key = f"rate_limit:{telegram_id}"
-    current = await redis_client.get(key)
-    if current is None:
-        await redis_client.setex(key, 60, 1)
-        return True
-    if int(current) >= settings.rate_limit_per_minute:
-        return False
-    await redis_client.incr(key)
-    return True
+    
+    # Lua script to atomically check and increment rate limit
+    lua_script = """
+    local key = KEYS[1]
+    local limit = tonumber(ARGV[1])
+    local ttl = tonumber(ARGV[2])
+    
+    local current = redis.call('GET', key)
+    if current == false then
+        redis.call('SETEX', key, ttl, 1)
+        return 1
+    end
+    
+    current = tonumber(current)
+    if current >= limit then
+        return 0
+    end
+    
+    redis.call('INCR', key)
+    return 1
+    """
+    
+    try:
+        result = await redis_client.eval(
+            lua_script,
+            1,
+            key,
+            settings.rate_limit_per_minute,
+            60
+        )
+        return bool(result)
+    except Exception as e:
+        logger.error(f"Rate limit check error: {e}")
+        return True  # Fail open on Redis errors
 
 
 async def get_or_create_player(telegram_id: int, username: Optional[str] = None) -> Dict:
+    """Get or create a player by Telegram ID."""
     cache_key = f"player:{telegram_id}"
     cached = await redis_client.get(cache_key)
     if cached:
         return json.loads(cached)
     
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        player = await conn.fetchrow("""
-            SELECT * FROM players WHERE telegram_id = $1
-        """, telegram_id)
-        
-        if not player:
-            async with conn.transaction():
-                player_id = await conn.fetchval("""
-                    INSERT INTO players (telegram_id, username, current_phase)
-                    VALUES ($1, $2, $3)
-                    RETURNING id
-                """, telegram_id, username, EvolutionPhase.INIT)
-                
-                await conn.execute("""
-                    INSERT INTO colonies (player_id, cell_count, energy, biomass, 
-                                        mutation_tree, organelles, environment, pandemic_resistance)
-                    VALUES ($1, 1, 100.0, 1.0, '{}', '{}', 'ocean', 0.1)
-                """, player_id)
-                
-                player = await conn.fetchrow("""
-                    SELECT * FROM players WHERE id = $1
-                """, player_id)
-        
-        result = dict(player)
-        await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps(result))
-        return result
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            player = await conn.fetchrow("""
+                SELECT * FROM players WHERE telegram_id = $1
+            """, telegram_id)
+            
+            if not player:
+                async with conn.transaction():
+                    player_id = await conn.fetchval("""
+                        INSERT INTO players (telegram_id, username, current_phase)
+                        VALUES ($1, $2, $3)
+                        RETURNING id
+                    """, telegram_id, username, EvolutionPhase.INIT.value)
+                    
+                    await conn.execute("""
+                        INSERT INTO colonies (player_id, cell_count, energy, biomass, 
+                                            mutation_tree, organelles, environment, pandemic_resistance)
+                        VALUES ($1, 1, 100.0, 1.0, '{}', '{}', 'ocean', 0.1)
+                    """, player_id)
+                    
+                    player = await conn.fetchrow("""
+                        SELECT * FROM players WHERE id = $1
+                    """, player_id)
+            
+            result = dict(player)
+            await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps(result, default=str))
+            return result
+    except Exception as e:
+        logger.error(f"Error in get_or_create_player: {e}")
+        raise
+
+
+async def check_player_exists(telegram_id: int) -> Optional[Dict]:
+    """Check if a player exists without creating one."""
+    cache_key = f"player:{telegram_id}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+    
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            player = await conn.fetchrow("""
+                SELECT * FROM players WHERE telegram_id = $1
+            """, telegram_id)
+            
+            if player:
+                result = dict(player)
+                await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps(result, default=str))
+                return result
+            return None
+    except Exception as e:
+        logger.error(f"Error in check_player_exists: {e}")
+        return None
 
 
 async def get_colony_stats(player_id: int) -> ColonyStats:
+    """Get colony statistics for a player."""
     cache_key = f"colony:{player_id}"
     cached = await redis_client.get(cache_key)
     if cached:
         data = json.loads(cached)
+        # Check if phase is already EvolutionPhase or string
+        phase = data["phase"]
+        if isinstance(phase, str):
+            phase = EvolutionPhase(phase)
+        
         return ColonyStats(
             cell_count=data["cell_count"],
             energy=Decimal(data["energy"]),
             biomass=data["biomass"],
-            phase=EvolutionPhase(data["phase"]),
+            phase=phase,
             pandemic_resistance=data["pandemic_resistance"],
             organelles=data["organelles"],
-            mutations=[Gene(**g) for g in data["mutations"]]
+            mutations=[Gene(
+                id=g["id"],
+                name=g["name"],
+                rarity=GeneRarity(g["rarity"]) if isinstance(g["rarity"], str) else g["rarity"],
+                slot=g["slot"],
+                bonuses=g["bonuses"]
+            ) for g in data["mutations"]]
         )
     
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT c.*, p.current_phase as phase
-            FROM colonies c
-            JOIN players p ON c.player_id = p.id
-            WHERE p.id = $1
-        """, player_id)
-        
-        if not row:
-            raise ValueError("Colony not found")
-        
-        mutations = await conn.fetch("""
-            SELECT * FROM mutation_tree WHERE colony_id = $1
-        """, row["id"])
-        
-        genes = []
-        for m in mutations:
-            slot = m["slot"]
-            for gene in gene_pool[slot]:
-                if gene.id == m["gene_id"]:
-                    genes.append(gene)
-        
-        stats = ColonyStats(
-            cell_count=row["cell_count"],
-            energy=Decimal(row["energy"]),
-            biomass=float(row["biomass"]),
-            phase=EvolutionPhase(row["phase"]),
-            pandemic_resistance=float(row["pandemic_resistance"]),
-            organelles=json.loads(row["organelles"] or "{}"),
-            mutations=genes
-        )
-        
-        await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps({
-            "cell_count": stats.cell_count,
-            "energy": str(stats.energy),
-            "biomass": stats.biomass,
-            "phase": stats.phase,
-            "pandemic_resistance": stats.pandemic_resistance,
-            "organelles": stats.organelles,
-            "mutations": [{"id": g.id, "name": g.name, "rarity": g.rarity, "slot": g.slot, "bonuses": g.bonuses} for g in genes]
-        }))
-        
-        return stats
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT c.*, p.current_phase as phase
+                FROM colonies c
+                JOIN players p ON c.player_id = p.id
+                WHERE p.id = $1
+            """, player_id)
+            
+            if not row:
+                raise ValueError("Colony not found")
+            
+            mutations = await conn.fetch("""
+                SELECT * FROM mutation_tree WHERE colony_id = $1
+            """, row["id"])
+            
+            # Optimize N+1 problem with dict comprehension
+            gene_pool_map = {
+                gene.id: gene
+                for slot_genes in gene_pool.values()
+                for gene in slot_genes
+            }
+            
+            genes = [
+                gene_pool_map[m["gene_id"]]
+                for m in mutations
+                if m["gene_id"] in gene_pool_map
+            ]
+            
+            stats = ColonyStats(
+                cell_count=row["cell_count"],
+                energy=Decimal(row["energy"]),
+                biomass=float(row["biomass"]),
+                phase=EvolutionPhase(row["phase"]),
+                pandemic_resistance=float(row["pandemic_resistance"]),
+                organelles=json.loads(row["organelles"] or "{}"),
+                mutations=genes
+            )
+            
+            await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps({
+                "cell_count": stats.cell_count,
+                "energy": str(stats.energy),
+                "biomass": stats.biomass,
+                "phase": stats.phase.value,
+                "pandemic_resistance": stats.pandemic_resistance,
+                "organelles": stats.organelles,
+                "mutations": [{"id": g.id, "name": g.name, "rarity": g.rarity.value, "slot": g.slot, "bonuses": g.bonuses} for g in genes]
+            }))
+            
+            return stats
+    except Exception as e:
+        logger.error(f"Error in get_colony_stats: {e}")
+        raise
 
 
 def create_main_menu() -> ReplyKeyboardMarkup:
@@ -480,16 +593,18 @@ def create_main_menu() -> ReplyKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
-    REQUESTS_COUNT.inc()
-    
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(message.from_user.id, message.from_user.username)
-    stats = await get_colony_stats(player["id"])
-    
-    welcome_text = f"""
+    """Handle /start command."""
+    try:
+        REQUESTS_COUNT.inc()
+        
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(message.from_user.id, message.from_user.username)
+        stats = await get_colony_stats(player["id"])
+        
+        welcome_text = f"""
 🧫 <b>Добро пожаловать в Клеточную Империю!</b>
 
 Ваша колония:
@@ -501,36 +616,41 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 Цель: достичь <b>Планетарного разума</b> (10¹⁸ клеток)
 """
-    
-    await message.answer(welcome_text, reply_markup=create_main_menu(), parse_mode="HTML")
-    await state.set_state(GameStates.menu)
+        
+        await message.answer(welcome_text, reply_markup=create_main_menu(), parse_mode="HTML")
+        await state.set_state(GameStates.menu)
+    except Exception as e:
+        logger.error(f"Error in cmd_start: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
 
 @router.message(F.text == "📊 Статистика")
 async def show_stats(message: types.Message):
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(message.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        leaderboard = await conn.fetch("""
-            SELECT p.username, c.cell_count, c.biomass,
-                   RANK() OVER (ORDER BY c.cell_count DESC) as rank
-            FROM players p
-            JOIN colonies c ON p.id = c.player_id
-            ORDER BY c.cell_count DESC
-            LIMIT 10
-        """)
-    
-    rank_info = ""
-    for i, row in enumerate(leaderboard[:5], 1):
-        rank_info += f"{i}. <b>{row['username'] or 'Unknown'}</b>: {row['cell_count']:,} клеток\n"
-    
-    stats_text = f"""
+    """Show player statistics."""
+    try:
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(message.from_user.id)
+        stats = await get_colony_stats(player["id"])
+        
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            leaderboard = await conn.fetch("""
+                SELECT p.username, c.cell_count, c.biomass,
+                       RANK() OVER (ORDER BY c.cell_count DESC) as rank
+                FROM players p
+                JOIN colonies c ON p.id = c.player_id
+                ORDER BY c.cell_count DESC
+                LIMIT 10
+            """)
+        
+        rank_info = ""
+        for i, row in enumerate(leaderboard[:5], 1):
+            rank_info += f"{i}. <b>{row['username'] or 'Unknown'}</b>: {row['cell_count']:,} клеток\n"
+        
+        stats_text = f"""
 📊 <b>Ваша статистика</b>
 
 🧫 <b>Колония</b>
@@ -550,103 +670,113 @@ async def show_stats(message: types.Message):
 🎯 <b>Прогресс к Планетарному разуму</b>
 {(stats.cell_count / 10**18) * 100:.10f}%
 """
-    
-    await message.answer(stats_text, parse_mode="HTML", reply_markup=create_main_menu())
+        
+        await message.answer(stats_text, parse_mode="HTML", reply_markup=create_main_menu())
+    except Exception as e:
+        logger.error(f"Error in show_stats: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении статистики.")
 
 
 @router.message(F.text == "🧬 Эволюция")
 async def show_evolution(message: types.Message, state: FSMContext):
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(message.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    next_phase = None
-    next_threshold = None
-    
-    if stats.phase == EvolutionPhase.INIT:
-        next_phase = EvolutionPhase.SINGLE_CELL
-        next_threshold = 1
-    elif stats.phase == EvolutionPhase.SINGLE_CELL:
-        next_phase = EvolutionPhase.COLONY
-        next_threshold = 100
-    elif stats.phase == EvolutionPhase.COLONY:
-        next_phase = EvolutionPhase.MULTICELLULAR
-        next_threshold = 10_000
-    elif stats.phase == EvolutionPhase.MULTICELLULAR:
-        next_phase = EvolutionPhase.ECOSYSTEM
-        next_threshold = 1_000_000
-    elif stats.phase == EvolutionPhase.ECOSYSTEM:
-        next_phase = EvolutionPhase.SENTIENT_BIOMASS
-        next_threshold = 1_000_000_000
-    
-    evolution_text = f"""
+    """Show evolution tree and progress."""
+    try:
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(message.from_user.id)
+        stats = await get_colony_stats(player["id"])
+        
+        next_phase = None
+        next_threshold = None
+        
+        if stats.phase == EvolutionPhase.INIT:
+            next_phase = EvolutionPhase.SINGLE_CELL
+            next_threshold = 1
+        elif stats.phase == EvolutionPhase.SINGLE_CELL:
+            next_phase = EvolutionPhase.COLONY
+            next_threshold = 100
+        elif stats.phase == EvolutionPhase.COLONY:
+            next_phase = EvolutionPhase.MULTICELLULAR
+            next_threshold = 10_000
+        elif stats.phase == EvolutionPhase.MULTICELLULAR:
+            next_phase = EvolutionPhase.ECOSYSTEM
+            next_threshold = 1_000_000
+        elif stats.phase == EvolutionPhase.ECOSYSTEM:
+            next_phase = EvolutionPhase.SENTIENT_BIOMASS
+            next_threshold = 1_000_000_000
+        
+        evolution_text = f"""
 🧬 <b>Древо эволюции</b>
 
 <b>Текущий этап:</b> {stats.phase.value}
 <b>Клеток:</b> {stats.cell_count:,}
 
 """
-    
-    if next_phase:
-        progress = (stats.cell_count / next_threshold) * 100
-        evolution_text += f"""
+        
+        if next_phase:
+            progress = (stats.cell_count / next_threshold) * 100
+            evolution_text += f"""
 <b>Следующий этап:</b> {next_phase.value}
 <b>Требуется:</b> {next_threshold:,} клеток
 <b>Прогресс:</b> {progress:.1f}%
 
 {"▓" * int(progress / 5)}{"░" * (20 - int(progress / 5))}
 """
-    else:
-        evolution_text += "\n<b>🏆 Вы достигли максимального этапа!</b>"
-    
-    buttons = []
-    if stats.cell_count >= 1000:
-        buttons.append(InlineKeyboardButton(text="🔬 Исследовать мутацию", callback_data="research_mutation"))
-    if stats.cell_count >= 10000:
-        buttons.append(InlineKeyboardButton(text="🧪 Горизонтальный перенос", callback_data="horizontal_transfer"))
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
-    
-    await message.answer(evolution_text, parse_mode="HTML", reply_markup=keyboard)
-    await state.set_state(GameStates.evolution)
+        else:
+            evolution_text += "\n<b>🏆 Вы достигли максимального этапа!</b>"
+        
+        buttons = []
+        if stats.cell_count >= 1000:
+            buttons.append(InlineKeyboardButton(text="🔬 Исследовать мутацию", callback_data="research_mutation"))
+        if stats.cell_count >= 10000:
+            buttons.append(InlineKeyboardButton(text="🧪 Горизонтальный перенос", callback_data="horizontal_transfer"))
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
+        
+        await message.answer(evolution_text, parse_mode="HTML", reply_markup=keyboard)
+        await state.set_state(GameStates.evolution)
+    except Exception as e:
+        logger.error(f"Error in show_evolution: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении эволюции.")
 
 
 @router.callback_query(F.data == "research_mutation")
 async def research_mutation(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    
-    if not await check_rate_limit(callback.from_user.id):
-        await callback.message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(callback.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    available_slots = ["offensive", "defensive", "utility"]
-    current_slots = {g.slot for g in stats.mutations}
-    if len(current_slots) >= 3:
-        await callback.message.edit_text("❌ У вас уже максимум мутаций! Удалите старую для новой.")
-        return
-    
-    selected_slot = random.choice(available_slots)
-    new_gene = select_random_gene(selected_slot)
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        colony_id = await conn.fetchval("SELECT id FROM colonies WHERE player_id = $1", player["id"])
-        await conn.execute("""
-            INSERT INTO mutation_tree (colony_id, gene_id, slot, rarity, bonuses)
-            VALUES ($1, $2, $3, $4, $5)
-        """, colony_id, new_gene.id, selected_slot, new_gene.rarity, json.dumps(new_gene.bonuses))
-    
-    await redis_client.delete(f"player:{player['id']}")
-    await redis_client.delete(f"colony:{player['id']}")
-    
-    await callback.message.edit_text(
-        f"""✨ <b>Новая мутация!</b>
+    """Research a new mutation."""
+    try:
+        await callback.answer()
+        
+        if not await check_rate_limit(callback.from_user.id):
+            await callback.message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(callback.from_user.id)
+        stats = await get_colony_stats(player["id"])
+        
+        available_slots = ["offensive", "defensive", "utility"]
+        current_slots = {g.slot for g in stats.mutations}
+        if len(current_slots) >= 3:
+            await callback.message.edit_text("❌ У вас уже максимум мутаций! Удалите старую для новой.")
+            return
+        
+        selected_slot = random.choice(available_slots)
+        new_gene = select_random_gene(selected_slot)
+        
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            colony_id = await conn.fetchval("SELECT id FROM colonies WHERE player_id = $1", player["id"])
+            await conn.execute("""
+                INSERT INTO mutation_tree (colony_id, gene_id, slot, rarity, bonuses)
+                VALUES ($1, $2, $3, $4, $5)
+            """, colony_id, new_gene.id, selected_slot, new_gene.rarity.value, json.dumps(new_gene.bonuses))
+        
+        await redis_client.delete(f"player:{player['id']}")
+        await redis_client.delete(f"colony:{player['id']}")
+        
+        await callback.message.edit_text(
+            f"""✨ <b>Новая мутация!</b>
 
 <b>Ген:</b> {new_gene.name}
 <b>Слот:</b> {selected_slot}
@@ -654,20 +784,25 @@ async def research_mutation(callback: CallbackQuery, state: FSMContext):
 
 <b>Бонусы:</b>
 """ + "\n".join([f"• {k}: +{v:.1f}%" for k, v in new_gene.bonuses.items()]),
-        parse_mode="HTML"
-    )
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error in research_mutation: {e}", exc_info=True)
+        await callback.message.answer("❌ Произошла ошибка при исследовании мутации.")
 
 
 @router.message(F.text == "⚡ Метаболизм")
 async def show_metabolism(message: types.Message):
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(message.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    metabolism_text = f"""
+    """Show metabolism information."""
+    try:
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(message.from_user.id)
+        stats = await get_colony_stats(player["id"])
+        
+        metabolism_text = f"""
 ⚡ <b>Метаболизм колонии</b>
 
 <b>Текущая энергия:</b> {stats.energy:.2f}
@@ -681,91 +816,110 @@ async def show_metabolism(message: types.Message):
 
 {"⚠️ <b>Низкая энергия!</b>" if stats.energy < stats.cell_count * 0.1 else "✅ Энергия стабильна"}
 """
-    
-    buttons = [
-        InlineKeyboardButton(text="🌱 Добавить фотосинтез", callback_data="add_photosynthesis"),
-        InlineKeyboardButton(text="💎 Добавить хемосинтез", callback_data="add_chemosynthesis"),
-        InlineKeyboardButton(text="⚡ Добавить митохондрии", callback_data="add_mitochondria"),
-    ]
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
-    
-    await message.answer(metabolism_text, parse_mode="HTML", reply_markup=keyboard)
+        
+        buttons = [
+            InlineKeyboardButton(text="🌱 Добавить фотосинтез", callback_data="add_photosynthesis"),
+            InlineKeyboardButton(text="💎 Добавить хемосинтез", callback_data="add_chemosynthesis"),
+            InlineKeyboardButton(text="⚡ Добавить митохондрии", callback_data="add_mitochondria"),
+        ]
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
+        
+        await message.answer(metabolism_text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Error in show_metabolism: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении информации о метаболизме.")
 
 
 @router.callback_query(F.data.startswith("add_"))
 async def add_organelle(callback: CallbackQuery):
-    await callback.answer()
-    
-    organelle_type = callback.data.replace("add_", "")
-    player = await get_or_create_player(callback.from_user.id)
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        colony = await conn.fetchrow("""
-            SELECT c.* FROM colonies c
-            JOIN players p ON c.player_id = p.id
-            WHERE p.id = $1
-        """, player["id"])
+    """Add an organelle to the colony."""
+    try:
+        await callback.answer()
         
-        organelles = json.loads(colony["organelles"] or "{}")
-        current_count = organelles.get(organelle_type, 0)
+        organelle_type = callback.data.replace("add_", "")
+        player = await get_or_create_player(callback.from_user.id)
         
-        cost = 50 * (current_count + 1)
-        if colony["energy"] < cost:
-            await callback.message.edit_text("❌ Недостаточно энергии!")
-            return
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            colony = await conn.fetchrow("""
+                SELECT c.* FROM colonies c
+                JOIN players p ON c.player_id = p.id
+                WHERE p.id = $1
+            """, player["id"])
+            
+            organelles = json.loads(colony["organelles"] or "{}")
+            current_count = organelles.get(organelle_type, 0)
+            
+            cost = 50 * (current_count + 1)
+            if Decimal(colony["energy"]) < Decimal(str(cost)):
+                await callback.message.edit_text("❌ Недостаточно энергии!")
+                return
+            
+            organelles[organelle_type] = current_count + 1
+            
+            await conn.execute("""
+                UPDATE colonies 
+                SET organelles = $1, energy = energy - $2, last_calc_at = NOW()
+                WHERE id = $3
+            """, json.dumps(organelles), cost, colony["id"])
         
-        organelles[organelle_type] = current_count + 1
+        await redis_client.delete(f"player:{player['id']}")
+        await redis_client.delete(f"colony:{player['id']}")
         
-        await conn.execute("""
-            UPDATE colonies 
-            SET organelles = $1, energy = energy - $2, last_calc_at = NOW()
-            WHERE id = $3
-        """, json.dumps(organelles), cost, colony["id"])
-    
-    await redis_client.delete(f"player:{player['id']}")
-    await redis_client.delete(f"colony:{player['id']}")
-    
-    await callback.message.edit_text(f"✅ Добавлено: {organelle_type} (+1)")
+        await callback.message.edit_text(f"✅ Добавлено: {organelle_type} (+1)")
+    except Exception as e:
+        logger.error(f"Error in add_organelle: {e}", exc_info=True)
+        await callback.message.answer("❌ Произошла ошибка при добавлении органеллы.")
 
 
 @router.message(F.text == "🤝 Симбиоз")
 async def show_symbiosis(message: types.Message):
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(message.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        symbioses = await conn.fetch("""
-            SELECT sc.*, p.username as partner_name
-            FROM symbiosis_contracts sc
-            JOIN players p ON (sc.host_id = p.id OR sc.symbiont_id = p.id)
-            WHERE (sc.host_id = $1 OR sc.symbiont_id = $1) AND p.id != $1
-        """, player["id"])
-    
-    symbiosis_text = f"""
+    """Show symbiosis relationships."""
+    try:
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(message.from_user.id)
+        stats = await get_colony_stats(player["id"])
+        
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # Fixed SQL logic to correctly identify partner
+            symbioses = await conn.fetch("""
+                SELECT sc.*,
+                       CASE 
+                           WHEN sc.host_id = $1 THEN p2.username
+                           ELSE p1.username
+                       END as partner_name
+                FROM symbiosis_contracts sc
+                JOIN players p1 ON sc.host_id = p1.id
+                JOIN players p2 ON sc.symbiont_id = p2.id
+                WHERE sc.host_id = $1 OR sc.symbiont_id = $1
+            """, player["id"])
+        
+        symbiosis_text = f"""
 🤝 <b>Симбиоз и консорциумы</b>
 
 <b>Ваши симбиотические связи:</b> {len(symbioses)}
 
 """
-    
-    for sym in symbioses:
-        symbiosis_text += f"• <b>{sym['partner_name']}</b> - {sym['contract_type']} ({sym['resource_exchange_rate']:.1%})\n"
-    
-    buttons = [
-        InlineKeyboardButton(text="🌿 Предложить симбиоз", callback_data="request_symbiosis"),
-        InlineKeyboardButton(text="💌 Отправить споры", callback_data="send_spores"),
-    ]
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
-    
-    await message.answer(symbiosis_text, parse_mode="HTML", reply_markup=keyboard)
+        
+        for sym in symbioses:
+            symbiosis_text += f"• <b>{sym['partner_name']}</b> - {sym['contract_type']} ({sym['resource_exchange_rate']:.1%})\n"
+        
+        buttons = [
+            InlineKeyboardButton(text="🌿 Предложить симбиоз", callback_data="request_symbiosis"),
+            InlineKeyboardButton(text="💌 Отправить споры", callback_data="send_spores"),
+        ]
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
+        
+        await message.answer(symbiosis_text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Error in show_symbiosis: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении информации о симбиозе.")
 
 
 @router.callback_query(F.data == "request_symbiosis")
@@ -777,59 +931,91 @@ async def request_symbiosis(callback: CallbackQuery, state: FSMContext):
 
 @router.message(GameStates.symbiosis_request)
 async def process_symbiosis_request(message: types.Message, state: FSMContext):
+    """Process symbiosis request."""
     try:
-        target_id = int(message.text)
-    except ValueError:
-        await message.answer("❌ Неверный формат ID!")
-        return
-    
-    player = await get_or_create_player(message.from_user.id)
-    target = await get_or_create_player(target_id)
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        player_colony = await conn.fetchrow("SELECT cell_count FROM colonies WHERE player_id = $1", player["id"])
-        target_colony = await conn.fetchrow("SELECT cell_count FROM colonies WHERE player_id = $1", target["id"])
+        try:
+            target_id = int(message.text)
+        except ValueError:
+            await message.answer("❌ Неверный формат ID!")
+            return
         
-        if player_colony["cell_count"] > target_colony["cell_count"]:
-            contract_type = SymbiosisType.ENDOSYMBIOSIS
-        else:
-            contract_type = SymbiosisType.CONSORTIUM
+        # Validate player ID
+        if target_id <= 0:
+            await message.answer("❌ Неверный ID игрока!")
+            return
         
-        await conn.execute("""
-            INSERT INTO symbiosis_contracts (host_id, symbiont_id, contract_type, resource_exchange_rate)
-            VALUES ($1, $2, $3, 0.1)
-        """, player["id"], target["id"], contract_type)
-    
-    await bot.send_message(
-        target_id,
-        f"🤝 Игрок {message.from_user.username} предлагает симбиоз ({contract_type.value})!\n\nКолония получит +10% к росту."
-    )
-    
-    await message.answer(f"✅ Предложение симбиоза отправлено!")
-    await state.set_state(GameStates.menu)
+        if target_id == message.from_user.id:
+            await message.answer("❌ Нельзя отправить запрос самому себе!")
+            return
+        
+        player = await get_or_create_player(message.from_user.id)
+        
+        # Check if target player exists without creating
+        target = await check_player_exists(target_id)
+        if not target:
+            await message.answer("❌ Игрок не найден!")
+            return
+        
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            player_colony = await conn.fetchrow("SELECT cell_count FROM colonies WHERE player_id = $1", player["id"])
+            target_colony = await conn.fetchrow("SELECT cell_count FROM colonies WHERE player_id = $1", target["id"])
+            
+            if player_colony["cell_count"] > target_colony["cell_count"]:
+                contract_type = SymbiosisType.ENDOSYMBIOSIS
+            else:
+                contract_type = SymbiosisType.CONSORTIUM
+            
+            await conn.execute("""
+                INSERT INTO symbiosis_contracts (host_id, symbiont_id, contract_type, resource_exchange_rate)
+                VALUES ($1, $2, $3, 0.1)
+            """, player["id"], target["id"], contract_type.value)
+        
+        try:
+            await bot.send_message(
+                target_id,
+                f"🤝 Игрок {message.from_user.username} предлагает симбиоз ({contract_type.value})!\n\nКолония получит +10% к росту."
+            )
+        except Exception as e:
+            logger.warning(f"Could not send symbiosis message to {target_id}: {e}")
+        
+        await message.answer(f"✅ Предложение симбиоза отправлено!")
+        await state.set_state(GameStates.menu)
+    except Exception as e:
+        logger.error(f"Error in process_symbiosis_request: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при отправке запроса.")
 
 
 @router.message(F.text == "🌍 Среда")
 async def show_environment(message: types.Message):
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(message.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    environments = {
-        "ocean": {"name": "Океан", "energy": "⭐", "danger": "🛡️"},
-        "surface": {"name": "Поверхность", "energy": "⭐⭐⭐", "danger": "⚠️"},
-        "deep": {"name": "Глубины", "energy": "⭐⭐", "danger": "⚠️⚠️"},
-        "volcanic": {"name": "Гидротермальные источники", "energy": "⭐⭐⭐⭐", "danger": "⚠️⚠️⚠️"},
-        "ice": {"name": "Ледяной покров", "energy": "⭐", "danger": "🛡️🛡️"},
-    }
-    
-    current_env = environments.get(stats.organelles.get("environment", "ocean"))
-    
-    env_text = f"""
+    """Show environment information."""
+    try:
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(message.from_user.id)
+        
+        # Get current environment from colony, not organelles
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            colony = await conn.fetchrow("""
+                SELECT environment FROM colonies WHERE player_id = $1
+            """, player["id"])
+        
+        current_environment = colony["environment"] if colony else "ocean"
+        
+        environments = {
+            "ocean": {"name": "Океан", "energy": "⭐", "danger": "🛡️"},
+            "surface": {"name": "Поверхность", "energy": "⭐⭐⭐", "danger": "⚠️"},
+            "deep": {"name": "Глубины", "energy": "⭐⭐", "danger": "⚠️⚠️"},
+            "volcanic": {"name": "Гидротермальные источники", "energy": "⭐⭐⭐⭐", "danger": "⚠️⚠️⚠️"},
+            "ice": {"name": "Ледяной покров", "energy": "⭐", "danger": "🛡️🛡️"},
+        }
+        
+        current_env = environments.get(current_environment, environments["ocean"])
+        
+        env_text = f"""
 🌍 <b>Среда обитания</b>
 
 <b>Текущая среда:</b> {current_env['name']}
@@ -838,18 +1024,21 @@ async def show_environment(message: types.Message):
 
 <b>Доступные среды:</b>
 """
-    
-    for key, env in environments.items():
-        env_text += f"\n<b>{env['name']}</b> - Энергия: {env['energy']}, Опасность: {env['danger']}"
-    
-    buttons = []
-    for key in environments.keys():
-        if key != stats.organelles.get("environment", "ocean"):
-            buttons.append(InlineKeyboardButton(text=f"Переместиться в {environments[key]['name']}", callback_data=f"move_{key}"))
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
-    
-    await message.answer(env_text, parse_mode="HTML", reply_markup=keyboard)
+        
+        for key, env in environments.items():
+            env_text += f"\n<b>{env['name']}</b> - Энергия: {env['energy']}, Опасность: {env['danger']}"
+        
+        buttons = []
+        for key in environments.keys():
+            if key != current_environment:
+                buttons.append(InlineKeyboardButton(text=f"Переместиться в {environments[key]['name']}", callback_data=f"move_{key}"))
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
+        
+        await message.answer(env_text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Error in show_environment: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении информации о среде.")
 
 
 @router.callback_query(F.data.startswith("move_"))
@@ -881,37 +1070,42 @@ async def move_environment(callback: CallbackQuery):
 
 @router.message(F.text == "🔬 Лаборатория")
 async def show_lab(message: types.Message):
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    player = await get_or_create_player(message.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    lab_text = f"""
+    """Show genetic laboratory."""
+    try:
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        player = await get_or_create_player(message.from_user.id)
+        stats = await get_colony_stats(player["id"])
+        
+        lab_text = f"""
 🔬 <b>Генетическая лаборатория</b>
 
 <b>Активные мутации:</b>
 """
-    
-    for i, gene in enumerate(stats.mutations, 1):
-        lab_text += f"\n{i}. <b>{gene.name}</b> ({gene.rarity.value}) - {gene.slot}"
-        lab_text += "\n" + "\n".join([f"   • {k}: +{v:.1f}%" for k, v in gene.bonuses.items()])
-    
-    if not stats.mutations:
-        lab_text += "\n<i>Мутации не обнаружены</i>"
-    
-    synergy = calculate_synergy_bonus(stats.mutations)
-    if synergy > 1.0:
-        lab_text += f"\n\n✨ <b>Синергия:</b> x{synergy:.1f}"
-    
-    buttons = []
-    if len(stats.mutations) > 0:
-        buttons.append(InlineKeyboardButton(text="🗑️ Удалить мутацию", callback_data="remove_mutation"))
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
-    
-    await message.answer(lab_text, parse_mode="HTML", reply_markup=keyboard)
+        
+        for i, gene in enumerate(stats.mutations, 1):
+            lab_text += f"\n{i}. <b>{gene.name}</b> ({gene.rarity.value}) - {gene.slot}"
+            lab_text += "\n" + "\n".join([f"   • {k}: +{v:.1f}%" for k, v in gene.bonuses.items()])
+        
+        if not stats.mutations:
+            lab_text += "\n<i>Мутации не обнаружены</i>"
+        
+        synergy = calculate_synergy_bonus(stats.mutations)
+        if synergy > 1.0:
+            lab_text += f"\n\n✨ <b>Синергия:</b> x{synergy:.1f}"
+        
+        buttons = []
+        if len(stats.mutations) > 0:
+            buttons.append(InlineKeyboardButton(text="🗑️ Удалить мутацию", callback_data="remove_mutation"))
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
+        
+        await message.answer(lab_text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Error in show_lab: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении информации о лаборатории.")
 
 
 @router.callback_query(F.data == "remove_mutation")
@@ -954,32 +1148,39 @@ async def remove_gene(callback: CallbackQuery):
 
 @router.message(Command("leaderboard"))
 async def cmd_leaderboard(message: types.Message):
-    if not await check_rate_limit(message.from_user.id):
-        await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
-        return
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        top_players = await conn.fetch("""
-            SELECT p.username, c.cell_count, c.biomass, p.current_phase,
-                   RANK() OVER (ORDER BY c.cell_count DESC) as rank
-            FROM players p
-            JOIN colonies c ON p.id = c.player_id
-            ORDER BY c.cell_count DESC
-            LIMIT 20
-        """)
-    
-    board_text = "🏆 <b>Топ-20 игроков</b>\n\n"
-    for player in top_players:
-        board_text += f"{player['rank']}. <b>{player['username'] or 'Unknown'}</b>\n"
-        board_text += f"   {player['cell_count']:,} клеток | {player['biomass']:.1f} биомассы | {player['current_phase']}\n\n"
-    
-    await message.answer(board_text, parse_mode="HTML", reply_markup=create_main_menu())
+    """Show top players leaderboard."""
+    try:
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+        
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            top_players = await conn.fetch("""
+                SELECT p.username, c.cell_count, c.biomass, p.current_phase,
+                       RANK() OVER (ORDER BY c.cell_count DESC) as rank
+                FROM players p
+                JOIN colonies c ON p.id = c.player_id
+                ORDER BY c.cell_count DESC
+                LIMIT 20
+            """)
+        
+        board_text = "🏆 <b>Топ-20 игроков</b>\n\n"
+        for player in top_players:
+            board_text += f"{player['rank']}. <b>{player['username'] or 'Unknown'}</b>\n"
+            board_text += f"   {player['cell_count']:,} клеток | {player['biomass']:.1f} биомассы | {player['current_phase']}\n\n"
+        
+        await message.answer(board_text, parse_mode="HTML", reply_markup=create_main_menu())
+    except Exception as e:
+        logger.error(f"Error in cmd_leaderboard: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка при получении таблицы лидеров.")
 
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
-    help_text = """
+    """Show help information."""
+    try:
+        help_text = """
 📖 <b>Помощь по Клеточной Империи</b>
 
 <b>Основные команды:</b>
@@ -1008,25 +1209,49 @@ async def cmd_help(message: types.Message):
 • Адаптируйтесь к среде для бонусов
 • Сотрудничайте через симбиоз
 """
-    
-    await message.answer(help_text, parse_mode="HTML", reply_markup=create_main_menu())
+        
+        await message.answer(help_text, parse_mode="HTML", reply_markup=create_main_menu())
+    except Exception as e:
+        logger.error(f"Error in cmd_help: {e}", exc_info=True)
+        await message.answer("❌ Произошла ошибка.")
 
 
 @app.post(settings.webhook_path)
 async def webhook_handler(request: Request):
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret != settings.webhook_secret:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-    
-    update = await request.json()
-    telegram_update = types.Update(**update)
-    
-    await dp.feed_update(bot, telegram_update)
-    return {"status": "ok"}
+    """Handle incoming webhook requests from Telegram."""
+    try:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret != settings.webhook_secret:
+            raise HTTPException(status_code=403, detail="Invalid secret")
+        
+        try:
+            update = await request.json()
+        except Exception as e:
+            logger.error(f"Invalid JSON in webhook: {e}")
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+        
+        try:
+            telegram_update = types.Update(**update)
+        except Exception as e:
+            logger.error(f"Invalid Update object: {e}")
+            raise HTTPException(status_code=400, detail="Invalid update format")
+        
+        await dp.feed_update(bot, telegram_update)
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in webhook handler: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# Register router
+dp.include_router(router)
 
 
 @app.on_event("startup")
 async def on_startup():
+    """Initialize application on startup."""
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -1105,6 +1330,8 @@ async def on_startup():
             CREATE INDEX IF NOT EXISTS idx_colonies_player ON colonies(player_id);
             CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_colony_id);
             CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_mutation_tree_colony ON mutation_tree(colony_id);
+            CREATE INDEX IF NOT EXISTS idx_mutation_tree_gene ON mutation_tree(gene_id);
         """)
     
     await bot.set_webhook(
@@ -1118,9 +1345,41 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    await bot.delete_webhook()
-    await dp.storage.close()
-    await bot.session.close()
+    """Gracefully shutdown the application."""
+    global db_pool
+    
+    try:
+        logger.info("Shutting down bot...")
+        await bot.delete_webhook()
+    except Exception as e:
+        logger.error(f"Error deleting webhook: {e}")
+    
+    try:
+        if dp.storage is not None:
+            await dp.storage.close()
+    except Exception as e:
+        logger.error(f"Error closing storage: {e}")
+    
+    try:
+        if bot.session is not None:
+            await bot.session.close()
+    except Exception as e:
+        logger.error(f"Error closing bot session: {e}")
+    
+    try:
+        if db_pool is not None:
+            await db_pool.close()
+            logger.info("Database pool closed")
+    except Exception as e:
+        logger.error(f"Error closing database pool: {e}")
+    
+    try:
+        await redis_client.close()
+        logger.info("Redis connection closed")
+    except Exception as e:
+        logger.error(f"Error closing Redis connection: {e}")
+    
+    logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
