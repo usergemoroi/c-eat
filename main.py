@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from decimal import Decimal
 
 import asyncpg
@@ -100,6 +100,116 @@ celery_app.conf.beat_schedule = {
 REQUESTS_COUNT = Counter("bot_requests_total", "Total requests")
 ACTIVE_PLAYERS = Gauge("active_players", "Active players")
 COLONY_SIZE = Histogram("colony_size_cells", "Colony size in cells")
+
+# Locks: created lazily to avoid binding to the wrong event loop (e.g. Celery tasks)
+_db_pool_init_lock: Optional[asyncio.Lock] = None
+_locks_guard: Optional[asyncio.Lock] = None
+_player_locks: Dict[int, asyncio.Lock] = {}
+_symbiosis_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+
+
+def _ensure_locks_initialized() -> None:
+    """Ensure global asyncio locks are initialized.
+
+    Locks are initialized lazily to avoid issues with event-loop binding when the
+    module is imported in different runtimes.
+    """
+    global _db_pool_init_lock, _locks_guard
+    if _db_pool_init_lock is None:
+        _db_pool_init_lock = asyncio.Lock()
+    if _locks_guard is None:
+        _locks_guard = asyncio.Lock()
+
+
+def validate_telegram_id(telegram_id: int) -> None:
+    """Validate Telegram user ID.
+
+    Telegram IDs are positive 64-bit integers.
+    """
+    if not isinstance(telegram_id, int):
+        raise ValueError("Telegram ID должен быть целым числом")
+    if telegram_id <= 0 or telegram_id >= 2**63:
+        raise ValueError("Telegram ID имеет неверное значение")
+
+
+def player_cache_key(telegram_id: int) -> str:
+    """Redis key for player cache (keyed by telegram_id)."""
+    return f"player:{telegram_id}"
+
+
+def colony_cache_key(player_id: int) -> str:
+    """Redis key for colony cache (keyed by internal player_id)."""
+    return f"colony:{player_id}"
+
+
+def parse_json_field(value: Any, default: Any) -> Any:
+    """Parse a JSON/JSONB field from asyncpg.
+
+    asyncpg can return JSONB columns as Python objects (dict/list) or as strings
+    depending on codecs/settings. This helper handles both.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return default
+    return default
+
+
+async def _get_player_lock(telegram_id: int) -> asyncio.Lock:
+    """Get a per-telegram_id lock to prevent race conditions."""
+    _ensure_locks_initialized()
+    assert _locks_guard is not None
+
+    async with _locks_guard:
+        lock = _player_locks.get(telegram_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _player_locks[telegram_id] = lock
+        return lock
+
+
+async def _get_symbiosis_lock(player_id_a: int, player_id_b: int) -> asyncio.Lock:
+    """Get a per-pair lock to serialize symbiosis creation."""
+    _ensure_locks_initialized()
+    assert _locks_guard is not None
+
+    pair = tuple(sorted((player_id_a, player_id_b)))
+    async with _locks_guard:
+        lock = _symbiosis_locks.get(pair)
+        if lock is None:
+            lock = asyncio.Lock()
+            _symbiosis_locks[pair] = lock
+        return lock
+
+
+async def invalidate_cache_keys(*keys: str) -> None:
+    """Best-effort cache invalidation."""
+    if not keys:
+        return
+    try:
+        await redis_client.delete(*keys)
+    except Exception as e:
+        logger.warning(f"Failed to invalidate cache keys {keys}: {e}", exc_info=True)
+
+
+async def invalidate_player_cache(telegram_id: int) -> None:
+    """Invalidate cached player data for a Telegram user."""
+    await invalidate_cache_keys(player_cache_key(telegram_id))
+
+
+async def invalidate_colony_cache(player_id: int) -> None:
+    """Invalidate cached colony data for an internal player id."""
+    await invalidate_cache_keys(colony_cache_key(player_id))
+
+
+async def invalidate_player_and_colony_cache(telegram_id: int, player_id: int) -> None:
+    """Invalidate both player and colony cache entries."""
+    await invalidate_cache_keys(player_cache_key(telegram_id), colony_cache_key(player_id))
 
 
 class EvolutionPhase(str, Enum):
@@ -239,15 +349,36 @@ def get_phase_by_cell_count(cell_count: int) -> EvolutionPhase:
 
 
 def calculate_synergy_bonus(genes: List[Gene]) -> float:
-    """Calculate synergy bonus based on identical genes (not slots)."""
+    """Calculate synergy bonus.
+
+    Синергия учитывает:
+    1) Дубликаты генов (по gene.id): каждая дополнительная копия даёт +10% к
+       множителю (мультипликативно), максимум x1.5 на один тип гена.
+    2) Комбинации слотов: наличие хотя бы одного гена в каждом из трёх слотов
+       (offensive/defensive/utility) даёт +10%.
+    3) Разнообразие раритетов: наличие хотя бы 3 разных раритетов даёт +5%.
+    """
+    if not genes:
+        return 1.0
+
     from collections import Counter
-    # Count identical genes by their IDs, not slots
-    gene_ids = [g.id for g in genes]
-    counts = Counter(gene_ids)
+
+    counts = Counter(g.id for g in genes)
     bonus = 1.0
+
     for count in counts.values():
-        if count >= 3:
-            bonus *= 1.5
+        if count >= 2:
+            per_gene_bonus = min(1.0 + 0.10 * (count - 1), 1.5)
+            bonus *= per_gene_bonus
+
+    slots = {g.slot for g in genes}
+    if len(slots) >= 3:
+        bonus *= 1.10
+
+    rarities = {g.rarity if isinstance(g.rarity, GeneRarity) else GeneRarity(g.rarity) for g in genes}
+    if len(rarities) >= 3:
+        bonus *= 1.05
+
     return bonus
 
 
@@ -278,14 +409,26 @@ def select_random_gene(slot: str) -> Gene:
 
 
 async def get_db_pool() -> asyncpg.Pool:
-    """Get or create the global database pool."""
+    """Get or create the global database pool.
+
+    Protected by an asyncio.Lock to avoid double-initialization under concurrency.
+    """
     global db_pool
-    if db_pool is None:
-        db_pool = await asyncpg.create_pool(
-            settings.database_url,
-            min_size=settings.db_pool_min,
-            max_size=settings.db_pool_max,
-        )
+    _ensure_locks_initialized()
+    assert _db_pool_init_lock is not None
+
+    if db_pool is not None:
+        return db_pool
+
+    async with _db_pool_init_lock:
+        if db_pool is None:
+            db_pool = await asyncpg.create_pool(
+                settings.database_url,
+                min_size=settings.db_pool_min,
+                max_size=settings.db_pool_max,
+            )
+
+    assert db_pool is not None
     return db_pool
 
 
@@ -297,77 +440,137 @@ def process_metabolism():
 async def _process_metabolism_async():
     """Process metabolism for all colonies."""
     pool = None
+    task_redis: Optional[redis.Redis] = None
     try:
+        # Celery tasks use asyncio.run(), so create a Redis client bound to this loop.
+        task_redis = redis.from_url(settings.redis_url, decode_responses=True)
+
         pool = await asyncpg.create_pool(
             settings.database_url,
             min_size=settings.db_pool_min,
             max_size=settings.db_pool_max,
         )
         async with pool.acquire() as conn:
-            async with conn.transaction():
-                colonies = await conn.fetch("""
-                    SELECT id, cell_count, energy, biomass, organelles, environment, pandemic_resistance
-                    FROM colonies
-                    WHERE last_calc_at < NOW() - INTERVAL '30 seconds'
-                """)
-                
-                # Batch processing to avoid long transactions
-                batch_size = 100
-                processed = 0
-                
-                for i in range(0, len(colonies), batch_size):
-                    batch = colonies[i:i + batch_size]
-                    async with conn.transaction():
-                        for colony in batch:
+            colonies = await conn.fetch("""
+                SELECT c.id,
+                       c.player_id,
+                       p.telegram_id,
+                       c.cell_count,
+                       c.energy,
+                       c.organelles,
+                       c.environment
+                FROM colonies c
+                JOIN players p ON c.player_id = p.id
+                WHERE c.last_calc_at < NOW() - INTERVAL '30 seconds'
+            """)
+
+            # Batch processing to avoid long transactions
+            batch_size = 100
+            processed = 0
+
+            for i in range(0, len(colonies), batch_size):
+                batch = colonies[i:i + batch_size]
+                async with conn.transaction():
+                    for colony in batch:
+                        try:
+                            cell_count = int(colony["cell_count"])
+                            energy = Decimal(str(colony["energy"]))
+
+                            organelles_raw = parse_json_field(colony["organelles"], {})
+                            organelles = {
+                                k: int(v)
+                                for k, v in organelles_raw.items()
+                                if v is not None
+                            }
+
+                            environment = (colony["environment"] or "ocean").strip()
+                            if environment not in VALID_ENVIRONMENTS:
+                                environment = "ocean"
+
+                            sun_factor = Decimal("1.0") if environment == "surface" else Decimal("0.3")
+                            mineral_factor = Decimal("1.0") if environment in {"deep", "volcanic"} else Decimal("0.5")
+
+                            photosynthesis = (
+                                Decimal(str(organelles.get("photosynthesis", 0)))
+                                * Decimal("0.1")
+                                * sun_factor
+                            )
+                            chemosynthesis = (
+                                Decimal(str(organelles.get("chemosynthesis", 0)))
+                                * Decimal("0.05")
+                                * mineral_factor
+                            )
+
+                            base_metabolism = Decimal(str(cell_count)) * Decimal("0.01")
+                            organelle_upkeep = Decimal(str(sum(organelles.values()))) * Decimal("0.02")
+
+                            delta_e = photosynthesis + chemosynthesis - base_metabolism - organelle_upkeep
+                            new_energy = max(Decimal(0), energy + delta_e)
+
+                            if new_energy < Decimal("0.1") * Decimal(str(cell_count)):
+                                cell_loss = int(cell_count * 0.1)
+                                new_cell_count = max(1, cell_count - cell_loss)
+                                await conn.execute(
+                                    """
+                                    UPDATE colonies
+                                    SET cell_count = $1, energy = $2, last_calc_at = NOW()
+                                    WHERE id = $3
+                                    """,
+                                    new_cell_count,
+                                    new_energy,
+                                    colony["id"],
+                                )
+                            else:
+                                new_cell_count = cell_count
+                                await conn.execute(
+                                    """
+                                    UPDATE colonies
+                                    SET energy = $1, last_calc_at = NOW()
+                                    WHERE id = $2
+                                    """,
+                                    new_energy,
+                                    colony["id"],
+                                )
+
+                            phase = get_phase_by_cell_count(new_cell_count)
+                            await conn.execute(
+                                """
+                                UPDATE players
+                                SET current_phase = $1
+                                WHERE id = $2
+                                """,
+                                phase.value,
+                                colony["player_id"],
+                            )
+
+                            # Invalidate caches for this player (colony stats + player profile)
                             try:
-                                cell_count = colony["cell_count"]
-                                energy = Decimal(str(colony["energy"]))
-                                organelles = json.loads(colony["organelles"] or "{}")
-                                environment = colony["environment"] or "ocean"
-                                
-                                sun_factor = Decimal("1.0") if environment in ["surface", "shallow"] else Decimal("0.3")
-                                mineral_factor = Decimal("1.0") if environment in ["deep", "volcanic"] else Decimal("0.5")
-                                
-                                photosynthesis = Decimal(str(organelles.get("photosynthesis", 0))) * Decimal("0.1") * sun_factor
-                                chemosynthesis = Decimal(str(organelles.get("chemosynthesis", 0))) * Decimal("0.05") * mineral_factor
-                                base_metabolism = Decimal(str(cell_count)) * Decimal("0.01")
-                                organelle_upkeep = Decimal(str(sum(organelles.values()))) * Decimal("0.02")
-                                
-                                delta_e = photosynthesis + chemosynthesis - base_metabolism - organelle_upkeep
-                                new_energy = max(Decimal(0), energy + delta_e)
-                                
-                                if new_energy < Decimal("0.1") * Decimal(str(cell_count)):
-                                    cell_loss = int(cell_count * 0.1)
-                                    new_cell_count = max(1, cell_count - cell_loss)
-                                    await conn.execute("""
-                                        UPDATE colonies 
-                                        SET cell_count = $1, energy = $2, last_calc_at = NOW()
-                                        WHERE id = $3
-                                    """, new_cell_count, new_energy, colony["id"])
-                                else:
-                                    new_cell_count = cell_count
-                                    await conn.execute("""
-                                        UPDATE colonies 
-                                        SET energy = $1, last_calc_at = NOW()
-                                        WHERE id = $2
-                                    """, new_energy, colony["id"])
-                                
-                                phase = get_phase_by_cell_count(new_cell_count)
-                                await conn.execute("""
-                                    UPDATE players SET current_phase = $1 WHERE id = (
-                                        SELECT player_id FROM colonies WHERE id = $2
-                                    )
-                                """, phase.value, colony["id"])
-                                processed += 1
+                                await task_redis.delete(
+                                    player_cache_key(int(colony["telegram_id"])),
+                                    colony_cache_key(int(colony["player_id"])),
+                                )
                             except Exception as e:
-                                logger.error(f"Error processing colony {colony['id']}: {e}")
-                                continue
-                logger.info(f"Metabolism processed {processed} colonies")
+                                logger.warning(
+                                    f"Failed to invalidate cache for player {colony['player_id']}: {e}",
+                                    exc_info=True,
+                                )
+
+                            processed += 1
+                        except Exception as e:
+                            logger.error(f"Error processing colony {colony['id']}: {e}", exc_info=True)
+                            continue
+
+            logger.info(f"Metabolism processed {processed} colonies")
     except Exception as e:
         logger.error(f"Error in metabolism processing: {e}", exc_info=True)
     finally:
         if pool is not None:
             await pool.close()
+        if task_redis is not None:
+            try:
+                await task_redis.close()
+            except Exception as e:
+                logger.warning(f"Error closing task Redis client: {e}", exc_info=True)
 
 
 @celery_app.task
@@ -378,7 +581,10 @@ def trigger_global_event():
 async def _trigger_global_event_async():
     """Trigger a global event affecting random colonies."""
     pool = None
+    task_redis: Optional[redis.Redis] = None
     try:
+        task_redis = redis.from_url(settings.redis_url, decode_responses=True)
+
         pool = await asyncpg.create_pool(
             settings.database_url,
             min_size=settings.db_pool_min,
@@ -387,37 +593,96 @@ async def _trigger_global_event_async():
         async with pool.acquire() as conn:
             event_type = random.choice([EventType.VIRUS, EventType.ICE_AGE, EventType.RADIATION])
             severity = random.random()
-            
-            await conn.execute("""
+
+            affected_rows = await conn.fetch(
+                """
                 INSERT INTO events (type, target_colony_id, params, expires_at)
                 SELECT $1, id, $2, NOW() + INTERVAL '24 hours'
                 FROM colonies
                 WHERE random() < $3
-            """, event_type.value, json.dumps({"severity": severity}), 0.3)
-            
+                RETURNING target_colony_id
+                """,
+                event_type.value,
+                json.dumps({"severity": severity}),
+                0.3,
+            )
+
+            colony_ids = [int(r["target_colony_id"]) for r in affected_rows]
+            if not colony_ids:
+                logger.info(f"Triggered global event: {event_type.value} with severity {severity} (0 colonies)")
+                return
+
             if event_type == EventType.VIRUS:
-                await conn.execute("""
-                    UPDATE colonies 
-                    SET cell_count = GREATEST(1, cell_count * (1 - $1 * (1 - pandemic_resistance)))
-                    WHERE id IN (SELECT target_colony_id FROM events WHERE type = $2)
-                """, severity, event_type.value)
+                await conn.execute(
+                    """
+                    UPDATE colonies
+                    SET cell_count = GREATEST(
+                        1,
+                        (cell_count * (1 - $1 * (1 - pandemic_resistance)))::bigint
+                    )
+                    WHERE id = ANY($2::int[])
+                    """,
+                    severity,
+                    colony_ids,
+                )
             elif event_type == EventType.RADIATION:
-                # Fixed: Use jsonb_set to properly increment radiation_mutations count
-                await conn.execute("""
-                    UPDATE colonies 
+                await conn.execute(
+                    """
+                    UPDATE colonies
                     SET mutation_tree = jsonb_set(
                         mutation_tree,
                         '{radiation_mutations}',
-                        COALESCE((mutation_tree->>'radiation_mutations')::int, 0) + 1
+                        to_jsonb(COALESCE((mutation_tree->>'radiation_mutations')::int, 0) + 1)
                     )
-                    WHERE id IN (SELECT target_colony_id FROM events WHERE type = $1)
-                """, event_type.value)
-            logger.info(f"Triggered global event: {event_type.value} with severity {severity}")
+                    WHERE id = ANY($1::int[])
+                    """,
+                    colony_ids,
+                )
+            elif event_type == EventType.ICE_AGE:
+                # Energy decreases due to harsher conditions
+                await conn.execute(
+                    """
+                    UPDATE colonies
+                    SET energy = GREATEST(0, energy - (energy * ($1::numeric * 0.2)))
+                    WHERE id = ANY($2::int[])
+                    """,
+                    severity,
+                    colony_ids,
+                )
+
+            # Invalidate caches for affected colonies
+            try:
+                affected_players = await conn.fetch(
+                    """
+                    SELECT c.player_id, p.telegram_id
+                    FROM colonies c
+                    JOIN players p ON c.player_id = p.id
+                    WHERE c.id = ANY($1::int[])
+                    """,
+                    colony_ids,
+                )
+                keys: List[str] = []
+                for row in affected_players:
+                    keys.append(player_cache_key(int(row["telegram_id"])))
+                    keys.append(colony_cache_key(int(row["player_id"])))
+                if keys:
+                    await task_redis.delete(*keys)
+            except Exception as e:
+                logger.warning(f"Failed to invalidate caches after global event: {e}", exc_info=True)
+
+            logger.info(
+                f"Triggered global event: {event_type.value} with severity {severity} ({len(colony_ids)} colonies)"
+            )
     except Exception as e:
         logger.error(f"Error triggering global event: {e}", exc_info=True)
     finally:
         if pool is not None:
             await pool.close()
+        if task_redis is not None:
+            try:
+                await task_redis.close()
+            except Exception as e:
+                logger.warning(f"Error closing task Redis client: {e}", exc_info=True)
 
 
 @celery_app.task
@@ -427,6 +692,11 @@ def backup_database():
 
 async def check_rate_limit(telegram_id: int) -> bool:
     """Check rate limit for a user using atomic Redis operation."""
+    try:
+        validate_telegram_id(telegram_id)
+    except ValueError:
+        return True
+
     key = f"rate_limit:{telegram_id}"
     
     # Lua script to atomically check and increment rate limit
@@ -460,81 +730,121 @@ async def check_rate_limit(telegram_id: int) -> bool:
         )
         return bool(result)
     except Exception as e:
-        logger.error(f"Rate limit check error: {e}")
+        logger.error(f"Rate limit check error: {e}", exc_info=True)
         return True  # Fail open on Redis errors
 
 
 async def get_or_create_player(telegram_id: int, username: Optional[str] = None) -> Dict:
-    """Get or create a player by Telegram ID."""
-    cache_key = f"player:{telegram_id}"
-    cached = await redis_client.get(cache_key)
-    if cached:
+    """Get or create a player by Telegram ID.
+
+    Uses a per-user asyncio.Lock and an UPSERT to prevent race conditions.
+    """
+    validate_telegram_id(telegram_id)
+
+    lock = await _get_player_lock(telegram_id)
+    async with lock:
+        cache_key = player_cache_key(telegram_id)
+        cached = await redis_client.get(cache_key)
+        if cached:
+            try:
+                data = json.loads(cached)
+                cached_at = data.get("cached_at")
+                if cached_at:
+                    try:
+                        cached_dt = datetime.fromisoformat(cached_at)
+                        if datetime.utcnow() - cached_dt > timedelta(seconds=settings.redis_cache_ttl * 2):
+                            raise ValueError("stale cache")
+                    except Exception:
+                        pass
+                if isinstance(data, dict) and data.get("telegram_id") == telegram_id and "id" in data:
+                    return data
+            except Exception as e:
+                logger.warning(f"Cache data corrupted for player {telegram_id}: {e}", exc_info=True)
+                await redis_client.delete(cache_key)
+
         try:
-            return json.loads(cached)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning(f"Cache data corrupted for player {telegram_id}: {e}")
-            await redis_client.delete(cache_key)
-    
-    try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            player = await conn.fetchrow("""
-                SELECT * FROM players WHERE telegram_id = $1
-            """, telegram_id)
-            
-            if not player:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
                 async with conn.transaction():
-                    player_id = await conn.fetchval("""
+                    player = await conn.fetchrow(
+                        """
                         INSERT INTO players (telegram_id, username, current_phase)
                         VALUES ($1, $2, $3)
-                        RETURNING id
-                    """, telegram_id, username, EvolutionPhase.INIT.value)
-                    
-                    await conn.execute("""
-                        INSERT INTO colonies (player_id, cell_count, energy, biomass, 
-                                            mutation_tree, organelles, environment, pandemic_resistance)
-                        VALUES ($1, 1, 100.0, 1.0, '{}', '{}', 'ocean', 0.1)
-                    """, player_id)
-                    
-                    player = await conn.fetchrow("""
-                        SELECT * FROM players WHERE id = $1
-                    """, player_id)
-            
-            result = dict(player)
-            try:
-                await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps(result, default=str))
-            except Exception as e:
-                logger.warning(f"Failed to cache player data: {e}")
-            return result
-    except Exception as e:
-        logger.error(f"Error in get_or_create_player: {e}", exc_info=True)
-        raise
+                        ON CONFLICT (telegram_id) DO UPDATE
+                        SET username = COALESCE(EXCLUDED.username, players.username),
+                            last_activity = NOW()
+                        RETURNING *
+                        """,
+                        telegram_id,
+                        username,
+                        EvolutionPhase.INIT.value,
+                    )
+
+                    if not player:
+                        raise RuntimeError("Не удалось получить данные игрока")
+
+                    # Ensure colony exists for this player
+                    await conn.execute(
+                        """
+                        INSERT INTO colonies (
+                            player_id, cell_count, energy, biomass,
+                            mutation_tree, organelles, environment, pandemic_resistance
+                        )
+                        SELECT $1, 1, 100.0, 1.0, '{}'::jsonb, '{}'::jsonb, 'ocean', 0.1
+                        WHERE NOT EXISTS (SELECT 1 FROM colonies WHERE player_id = $1)
+                        """,
+                        player["id"],
+                    )
+
+                result = dict(player)
+                result["cached_at"] = datetime.utcnow().isoformat()
+
+                try:
+                    await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps(result, default=str))
+                except Exception as e:
+                    logger.warning(f"Failed to cache player data: {e}", exc_info=True)
+
+                return result
+        except Exception as e:
+            logger.error(f"Error in get_or_create_player: {e}", exc_info=True)
+            raise
 
 
 async def check_player_exists(telegram_id: int) -> Optional[Dict]:
     """Check if a player exists without creating one."""
-    cache_key = f"player:{telegram_id}"
+    try:
+        validate_telegram_id(telegram_id)
+    except ValueError:
+        return None
+
+    cache_key = player_cache_key(telegram_id)
     cached = await redis_client.get(cache_key)
     if cached:
         try:
-            return json.loads(cached)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning(f"Cache data corrupted for player {telegram_id}: {e}")
+            data = json.loads(cached)
+            if isinstance(data, dict) and data.get("telegram_id") == telegram_id and "id" in data:
+                return data
+        except Exception as e:
+            logger.warning(f"Cache data corrupted for player {telegram_id}: {e}", exc_info=True)
             await redis_client.delete(cache_key)
-    
+
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            player = await conn.fetchrow("""
+            player = await conn.fetchrow(
+                """
                 SELECT * FROM players WHERE telegram_id = $1
-            """, telegram_id)
-            
+                """,
+                telegram_id,
+            )
+
             if player:
                 result = dict(player)
+                result["cached_at"] = datetime.utcnow().isoformat()
                 try:
                     await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps(result, default=str))
                 except Exception as e:
-                    logger.warning(f"Failed to cache player data: {e}")
+                    logger.warning(f"Failed to cache player data: {e}", exc_info=True)
                 return result
             return None
     except Exception as e:
@@ -544,99 +854,139 @@ async def check_player_exists(telegram_id: int) -> Optional[Dict]:
 
 async def get_colony_stats(player_id: int) -> ColonyStats:
     """Get colony statistics for a player."""
-    cache_key = f"colony:{player_id}"
+    cache_key = colony_cache_key(player_id)
     cached = await redis_client.get(cache_key)
     if cached:
         try:
             data = json.loads(cached)
-            # Check if phase is already EvolutionPhase or string
-            phase = data.get("phase")
-            if isinstance(phase, str):
-                phase = EvolutionPhase(phase)
-            
-            # Validate organelles and other fields
-            organelles = data.get("organelles", {})
-            mutations = data.get("mutations", [])
-            
+
+            cached_at = data.get("cached_at")
+            if cached_at:
+                try:
+                    cached_dt = datetime.fromisoformat(cached_at)
+                    if datetime.utcnow() - cached_dt > timedelta(seconds=settings.redis_cache_ttl * 2):
+                        raise ValueError("stale cache")
+                except Exception:
+                    pass
+
+            phase_raw = data.get("phase", EvolutionPhase.INIT.value)
+            phase = phase_raw if isinstance(phase_raw, EvolutionPhase) else EvolutionPhase(str(phase_raw))
+
+            organelles_raw = data.get("organelles") or {}
+            if not isinstance(organelles_raw, dict):
+                organelles_raw = {}
+            organelles = {k: int(v) for k, v in organelles_raw.items() if v is not None}
+
+            mutations_raw = data.get("mutations") or []
+            mutations: List[Gene] = []
+            if isinstance(mutations_raw, list):
+                for g in mutations_raw:
+                    try:
+                        mutations.append(
+                            Gene(
+                                id=g["id"],
+                                name=g["name"],
+                                rarity=GeneRarity(g["rarity"]) if isinstance(g.get("rarity"), str) else g["rarity"],
+                                slot=g["slot"],
+                                bonuses=g.get("bonuses", {}),
+                            )
+                        )
+                    except Exception:
+                        continue
+
             return ColonyStats(
-                cell_count=data["cell_count"],
-                energy=Decimal(data["energy"]),
-                biomass=data["biomass"],
+                cell_count=int(data["cell_count"]),
+                energy=Decimal(str(data["energy"])),
+                biomass=float(data["biomass"]),
                 phase=phase,
-                pandemic_resistance=data.get("pandemic_resistance", 0.1),
+                pandemic_resistance=float(data.get("pandemic_resistance", 0.1)),
                 organelles=organelles,
-                mutations=[Gene(
-                    id=g["id"],
-                    name=g["name"],
-                    rarity=GeneRarity(g["rarity"]) if isinstance(g["rarity"], str) else g["rarity"],
-                    slot=g["slot"],
-                    bonuses=g["bonuses"]
-                ) for g in mutations]
+                mutations=mutations,
             )
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning(f"Cache data corrupted for player {player_id}: {e}")
+        except Exception as e:
+            logger.warning(f"Cache data corrupted for player {player_id}: {e}", exc_info=True)
             await redis_client.delete(cache_key)
-    
+
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT c.*, p.current_phase as phase
                 FROM colonies c
                 JOIN players p ON c.player_id = p.id
                 WHERE p.id = $1
-            """, player_id)
-            
+                """,
+                player_id,
+            )
+
             if not row:
                 raise ValueError("Colony not found")
-            
-            mutations = await conn.fetch("""
-                SELECT * FROM mutation_tree WHERE colony_id = $1
-            """, row["id"])
-            
-            # Optimize N+1 problem with dict comprehension
+
+            mutations_rows = await conn.fetch(
+                """
+                SELECT gene_id FROM mutation_tree WHERE colony_id = $1
+                """,
+                row["id"],
+            )
+
             gene_pool_map = {
                 gene.id: gene
                 for slot_genes in gene_pool.values()
                 for gene in slot_genes
             }
-            
+
             genes = [
                 gene_pool_map[m["gene_id"]]
-                for m in mutations
+                for m in mutations_rows
                 if m["gene_id"] in gene_pool_map
             ]
-            
-            try:
-                organelles_data = json.loads(row["organelles"] or "{}")
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.warning(f"Invalid organelles JSON for colony {row['id']}: {e}")
+
+            organelles_data = parse_json_field(row["organelles"], {})
+            if not isinstance(organelles_data, dict):
                 organelles_data = {}
-            
+            organelles_data = {k: int(v) for k, v in organelles_data.items() if v is not None}
+
             stats = ColonyStats(
-                cell_count=row["cell_count"],
+                cell_count=int(row["cell_count"]),
                 energy=Decimal(str(row["energy"])),
                 biomass=float(row["biomass"]),
                 phase=EvolutionPhase(row["phase"]),
                 pandemic_resistance=float(row["pandemic_resistance"]),
                 organelles=organelles_data,
-                mutations=genes
+                mutations=genes,
             )
-            
-            # Cache the data
+
             try:
-                await redis_client.setex(cache_key, settings.redis_cache_ttl, json.dumps({
-                    "cell_count": stats.cell_count,
-                    "energy": str(stats.energy),
-                    "biomass": stats.biomass,
-                    "phase": stats.phase.value,
-                    "pandemic_resistance": stats.pandemic_resistance,
-                    "organelles": stats.organelles,
-                    "mutations": [{"id": g.id, "name": g.name, "rarity": g.rarity.value, "slot": g.slot, "bonuses": g.bonuses} for g in genes]
-                }, default=str))
+                await redis_client.setex(
+                    cache_key,
+                    settings.redis_cache_ttl,
+                    json.dumps(
+                        {
+                            "cell_count": stats.cell_count,
+                            "energy": str(stats.energy),
+                            "biomass": stats.biomass,
+                            "phase": stats.phase.value,
+                            "pandemic_resistance": stats.pandemic_resistance,
+                            "organelles": stats.organelles,
+                            "mutations": [
+                                {
+                                    "id": g.id,
+                                    "name": g.name,
+                                    "rarity": g.rarity.value,
+                                    "slot": g.slot,
+                                    "bonuses": g.bonuses,
+                                }
+                                for g in genes
+                            ],
+                            "cached_at": datetime.utcnow().isoformat(),
+                        },
+                        default=str,
+                    ),
+                )
             except Exception as e:
-                logger.warning(f"Failed to cache colony stats: {e}")
-            
+                logger.warning(f"Failed to cache colony stats: {e}", exc_info=True)
+
             return stats
     except Exception as e:
         logger.error(f"Error in get_colony_stats: {e}", exc_info=True)
@@ -820,40 +1170,50 @@ async def research_mutation(callback: CallbackQuery, state: FSMContext):
         player = await get_or_create_player(callback.from_user.id)
         stats = await get_colony_stats(player["id"])
         
-        available_slots = ["offensive", "defensive", "utility"]
         current_slots = {g.slot for g in stats.mutations}
         if len(current_slots) >= 3:
             await callback.message.edit_text("❌ У вас уже максимум мутаций! Удалите старую для новой.")
             return
-        
+
+        available_slots = [
+            slot for slot in ("offensive", "defensive", "utility")
+            if slot not in current_slots
+        ]
+        if not available_slots:
+            await callback.message.edit_text("❌ Нет доступных слотов для мутации.")
+            return
+
         selected_slot = random.choice(available_slots)
         new_gene = select_random_gene(selected_slot)
-        
+
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            colony_id = await conn.fetchval("SELECT id FROM colonies WHERE player_id = $1", player["id"])
-            
-            # Check for duplicate genes first
-            existing_gene = await conn.fetchrow("""
-                SELECT gene_id FROM mutation_tree WHERE colony_id = $1 AND gene_id = $2
-            """, colony_id, new_gene.id)
-            
-            if existing_gene:
-                await callback.message.edit_text("❌ У вас уже есть этот ген! Попробуйте еще раз.")
-                return
-            
-            try:
-                await conn.execute("""
-                    INSERT INTO mutation_tree (colony_id, gene_id, slot, rarity, bonuses)
-                    VALUES ($1, $2, $3, $4, $5)
-                """, colony_id, new_gene.id, selected_slot, new_gene.rarity.value, json.dumps(new_gene.bonuses))
-            except asyncpg.UniqueViolationError:
-                await callback.message.edit_text("❌ Ошибка: дубликат гена! Попробуйте еще раз.")
-                return
-        
-        # Invalidate cache
-        await redis_client.delete(f"player:{player['id']}")
-        await redis_client.delete(f"colony:{player['id']}")
+            async with conn.transaction():
+                colony_id = await conn.fetchval(
+                    "SELECT id FROM colonies WHERE player_id = $1",
+                    player["id"],
+                )
+                if not colony_id:
+                    await callback.message.edit_text("❌ Колония не найдена!")
+                    return
+
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO mutation_tree (colony_id, gene_id, slot, rarity, bonuses)
+                        VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        colony_id,
+                        new_gene.id,
+                        selected_slot,
+                        new_gene.rarity.value,
+                        json.dumps(new_gene.bonuses),
+                    )
+                except asyncpg.UniqueViolationError:
+                    await callback.message.edit_text("❌ У вас уже есть этот ген! Попробуйте еще раз.")
+                    return
+
+        await invalidate_player_and_colony_cache(callback.from_user.id, player["id"])
         
         await callback.message.edit_text(
             f"""✨ <b>Новая мутация!</b>
@@ -881,20 +1241,28 @@ async def show_metabolism(message: types.Message):
         
         player = await get_or_create_player(message.from_user.id)
         stats = await get_colony_stats(player["id"])
-        
+
+        consumption_per_sec = Decimal(stats.cell_count) * Decimal("0.01")
+        generation_per_sec = (
+            Decimal(str(stats.organelles.get("photosynthesis", 0))) * Decimal("0.1")
+            + Decimal(str(stats.organelles.get("chemosynthesis", 0))) * Decimal("0.05")
+        )
+        low_energy_threshold = Decimal(stats.cell_count) * Decimal("0.1")
+        energy_status = "⚠️ <b>Низкая энергия!</b>" if stats.energy < low_energy_threshold else "✅ Энергия стабильна"
+
         metabolism_text = f"""
 ⚡ <b>Метаболизм колонии</b>
 
 <b>Текущая энергия:</b> {stats.energy:.2f}
-<b>Потребление:</b> {stats.cell_count * 0.01:.2f}/сек
-<b>Генерация:</b> {(stats.organelles.get('photosynthesis', 0) * 0.1 + stats.organelles.get('chemosynthesis', 0) * 0.05):.2f}/сек
+<b>Потребление:</b> {consumption_per_sec:.2f}/сек
+<b>Генерация:</b> {generation_per_sec:.2f}/сек
 
 <b>Органеллы:</b>
 • Фотосинтез: {stats.organelles.get('photosynthesis', 0)}
 • Хемосинтез: {stats.organelles.get('chemosynthesis', 0)}
 • Митохондрии: {stats.organelles.get('mitochondria', 0)}
 
-{"⚠️ <b>Низкая энергия!</b>" if stats.energy < stats.cell_count * 0.1 else "✅ Энергия стабильна"}
+{energy_status}
 """
         
         buttons = [
@@ -935,13 +1303,12 @@ async def add_organelle(callback: CallbackQuery):
                     await callback.message.edit_text("❌ Колония не найдена!")
                     return
                 
-                try:
-                    organelles = json.loads(colony["organelles"] or "{}")
-                except (json.JSONDecodeError, TypeError) as e:
-                    logger.warning(f"Invalid organelles JSON for colony {colony['id']}: {e}")
+                organelles = parse_json_field(colony["organelles"], {})
+                if not isinstance(organelles, dict):
                     organelles = {}
-                
-                current_count = organelles.get(organelle_type, 0)
+                organelles = {k: int(v) for k, v in organelles.items() if v is not None}
+
+                current_count = int(organelles.get(organelle_type, 0) or 0)
                 cost = 50 * (current_count + 1)
                 current_energy = Decimal(str(colony["energy"]))
                 
@@ -957,9 +1324,7 @@ async def add_organelle(callback: CallbackQuery):
                     WHERE id = $3
                 """, json.dumps(organelles), cost, colony["id"])
         
-        # Invalidate cache
-        await redis_client.delete(f"player:{player['id']}")
-        await redis_client.delete(f"colony:{player['id']}")
+        await invalidate_player_and_colony_cache(callback.from_user.id, player["id"])
         
         organelle_names = {
             "photosynthesis": "Фотосинтез",
@@ -982,7 +1347,6 @@ async def show_symbiosis(message: types.Message):
             return
         
         player = await get_or_create_player(message.from_user.id)
-        stats = await get_colony_stats(player["id"])
         
         pool = await get_db_pool()
         async with pool.acquire() as conn:
@@ -1024,24 +1388,34 @@ async def show_symbiosis(message: types.Message):
 
 @router.callback_query(F.data == "request_symbiosis")
 async def request_symbiosis(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.edit_text("Введите Telegram ID игрока для симбиоза:")
-    await state.set_state(GameStates.symbiosis_request)
+    """Ask user for a target Telegram ID to create a symbiosis contract."""
+    try:
+        await callback.answer()
+
+        if not await check_rate_limit(callback.from_user.id):
+            await callback.message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+
+        await callback.message.edit_text("Введите Telegram ID игрока для симбиоза:")
+        await state.set_state(GameStates.symbiosis_request)
+    except Exception as e:
+        logger.error(f"Error in request_symbiosis: {e}", exc_info=True)
+        await callback.message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
 
 @router.message(GameStates.symbiosis_request)
 async def process_symbiosis_request(message: types.Message, state: FSMContext):
     """Process symbiosis request."""
     try:
-        try:
-            target_id = int(message.text)
-        except ValueError:
-            await message.answer("❌ Неверный формат ID!")
+        if not await check_rate_limit(message.from_user.id):
+            await message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
             return
-        
-        # Validate player ID
-        if target_id <= 0:
-            await message.answer("❌ Неверный ID игрока!")
+
+        try:
+            target_id = int((message.text or "").strip())
+            validate_telegram_id(target_id)
+        except (ValueError, TypeError):
+            await message.answer("❌ Неверный Telegram ID!")
             return
         
         if target_id == message.from_user.id:
@@ -1056,37 +1430,55 @@ async def process_symbiosis_request(message: types.Message, state: FSMContext):
             await message.answer("❌ Игрок не найден!")
             return
         
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            player_colony = await conn.fetchrow("SELECT cell_count FROM colonies WHERE player_id = $1", player["id"])
-            target_colony = await conn.fetchrow("SELECT cell_count FROM colonies WHERE player_id = $1", target["id"])
-            
-            # Validate that both colonies exist
-            if not player_colony or not target_colony:
-                await message.answer("❌ Ошибка: одна из колоний не найдена!")
-                return
-            
-            if player_colony["cell_count"] > target_colony["cell_count"]:
-                contract_type = SymbiosisType.ENDOSYMBIOSIS
-            else:
-                contract_type = SymbiosisType.CONSORTIUM
-            
-            try:
-                await conn.execute("""
-                    INSERT INTO symbiosis_contracts (host_id, symbiont_id, contract_type, resource_exchange_rate)
-                    VALUES ($1, $2, $3, 0.1)
-                """, player["id"], target["id"], contract_type.value)
-            except asyncpg.UniqueViolationError:
-                await message.answer("❌ Симбиоз между этими игроками уже существует!")
-                return
+        pair_lock = await _get_symbiosis_lock(player["id"], target["id"])
+        async with pair_lock:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    # Lock both colonies to make the comparison + insert consistent
+                    player_colony = await conn.fetchrow(
+                        "SELECT cell_count FROM colonies WHERE player_id = $1 FOR UPDATE",
+                        player["id"],
+                    )
+                    target_colony = await conn.fetchrow(
+                        "SELECT cell_count FROM colonies WHERE player_id = $1 FOR UPDATE",
+                        target["id"],
+                    )
+
+                    if not player_colony or not target_colony:
+                        await message.answer("❌ Ошибка: одна из колоний не найдена!")
+                        return
+
+                    if player_colony["cell_count"] > target_colony["cell_count"]:
+                        contract_type = SymbiosisType.ENDOSYMBIOSIS
+                    else:
+                        contract_type = SymbiosisType.CONSORTIUM
+
+                    try:
+                        await conn.execute(
+                            """
+                            INSERT INTO symbiosis_contracts (
+                                host_id, symbiont_id, contract_type, resource_exchange_rate
+                            )
+                            VALUES ($1, $2, $3, $4)
+                            """,
+                            player["id"],
+                            target["id"],
+                            contract_type.value,
+                            0.1,
+                        )
+                    except asyncpg.UniqueViolationError:
+                        await message.answer("❌ Симбиоз между этими игроками уже существует!")
+                        return
         
+        sender_name = message.from_user.username or message.from_user.full_name or "игрок"
         try:
             await bot.send_message(
                 target_id,
-                f"🤝 Игрок {message.from_user.username} предлагает симбиоз ({contract_type.value})!\n\nКолония получит +10% к росту."
+                f"🤝 Игрок {sender_name} предлагает симбиоз ({contract_type.value})!\n\nКолония получит +10% к росту."
             )
         except Exception as e:
-            logger.warning(f"Could not send symbiosis message to {target_id}: {e}")
+            logger.warning(f"Could not send symbiosis message to {target_id}: {e}", exc_info=True)
         
         await message.answer(f"✅ Предложение симбиоза отправлено!")
         await state.set_state(GameStates.menu)
@@ -1158,28 +1550,48 @@ async def show_environment(message: types.Message):
 @router.callback_query(F.data.startswith("move_"))
 async def move_environment(callback: CallbackQuery):
     """Move colony to a different environment."""
-    await callback.answer()
-    
-    new_env = callback.data.replace("move_", "")
-    
-    # Validate environment
-    if new_env not in VALID_ENVIRONMENTS:
-        logger.warning(f"Invalid environment requested: {new_env}")
-        await callback.message.edit_text("❌ Неверная среда обитания!")
-        return
-    
-    player = await get_or_create_player(callback.from_user.id)
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        colony_id = await conn.fetchval("SELECT id FROM colonies WHERE player_id = $1", player["id"])
-        await conn.execute("""
-            UPDATE colonies SET environment = $1 WHERE id = $2
-        """, new_env, colony_id)
-    
-    await redis_client.delete(f"colony:{player['id']}")
-    
-    await callback.message.edit_text(f"✅ Колония перемещена в {ENVIRONMENT_NAMES.get(new_env, new_env)}!")
+    try:
+        await callback.answer()
+
+        if not await check_rate_limit(callback.from_user.id):
+            await callback.message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+
+        new_env = (callback.data or "").replace("move_", "").strip()
+
+        if new_env not in VALID_ENVIRONMENTS:
+            logger.warning(f"Invalid environment requested: {new_env}")
+            await callback.message.edit_text("❌ Неверная среда обитания!")
+            return
+
+        player = await get_or_create_player(callback.from_user.id)
+
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                colony_id = await conn.fetchval(
+                    "SELECT id FROM colonies WHERE player_id = $1 FOR UPDATE",
+                    player["id"],
+                )
+                if not colony_id:
+                    await callback.message.edit_text("❌ Колония не найдена!")
+                    return
+
+                await conn.execute(
+                    """
+                    UPDATE colonies
+                    SET environment = $1
+                    WHERE id = $2
+                    """,
+                    new_env,
+                    colony_id,
+                )
+
+        await invalidate_colony_cache(player["id"])
+        await callback.message.edit_text(f"✅ Колония перемещена в {ENVIRONMENT_NAMES.get(new_env, new_env)}!")
+    except Exception as e:
+        logger.error(f"Error in move_environment: {e}", exc_info=True)
+        await callback.message.answer("❌ Произошла ошибка при смене среды.")
 
 
 @router.message(F.text == "🔬 Лаборатория")
@@ -1224,40 +1636,79 @@ async def show_lab(message: types.Message):
 
 @router.callback_query(F.data == "remove_mutation")
 async def remove_mutation_menu(callback: CallbackQuery):
-    await callback.answer()
-    
-    player = await get_or_create_player(callback.from_user.id)
-    stats = await get_colony_stats(player["id"])
-    
-    buttons = []
-    for i, gene in enumerate(stats.mutations, 1):
-        buttons.append(InlineKeyboardButton(
-            text=f"{i}. {gene.name}",
-            callback_data=f"remove_gene_{gene.id}"
-        ))
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 1] for i in range(0, len(buttons), 1)])
-    await callback.message.edit_text("Выберите мутацию для удаления:", reply_markup=keyboard)
+    """Show a menu to remove an existing mutation."""
+    try:
+        await callback.answer()
+
+        if not await check_rate_limit(callback.from_user.id):
+            await callback.message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+
+        player = await get_or_create_player(callback.from_user.id)
+        stats = await get_colony_stats(player["id"])
+
+        if not stats.mutations:
+            await callback.message.edit_text("❌ У вас нет мутаций для удаления.")
+            return
+
+        buttons: List[InlineKeyboardButton] = []
+        for i, gene in enumerate(stats.mutations, 1):
+            buttons.append(
+                InlineKeyboardButton(
+                    text=f"{i}. {gene.name}",
+                    callback_data=f"remove_gene_{gene.id}",
+                )
+            )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
+        await callback.message.edit_text("Выберите мутацию для удаления:", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Error in remove_mutation_menu: {e}", exc_info=True)
+        await callback.message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
 
 @router.callback_query(F.data.startswith("remove_gene_"))
 async def remove_gene(callback: CallbackQuery):
-    await callback.answer()
-    
-    gene_id = callback.data.replace("remove_gene_", "")
-    player = await get_or_create_player(callback.from_user.id)
-    
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        colony_id = await conn.fetchval("SELECT id FROM colonies WHERE player_id = $1", player["id"])
-        await conn.execute("""
-            DELETE FROM mutation_tree WHERE colony_id = $1 AND gene_id = $2
-        """, colony_id, gene_id)
-    
-    await redis_client.delete(f"player:{player['id']}")
-    await redis_client.delete(f"colony:{player['id']}")
-    
-    await callback.message.edit_text("🗑️ Мутация удалена!")
+    """Remove a mutation from the player's colony."""
+    try:
+        await callback.answer()
+
+        if not await check_rate_limit(callback.from_user.id):
+            await callback.message.answer("⏳ Превышен лимит запросов. Подождите минуту.")
+            return
+
+        gene_id = (callback.data or "").replace("remove_gene_", "").strip()
+        if not gene_id:
+            await callback.message.answer("❌ Неверный идентификатор мутации.")
+            return
+
+        player = await get_or_create_player(callback.from_user.id)
+
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                colony_id = await conn.fetchval(
+                    "SELECT id FROM colonies WHERE player_id = $1",
+                    player["id"],
+                )
+                if not colony_id:
+                    await callback.message.edit_text("❌ Колония не найдена!")
+                    return
+
+                await conn.execute(
+                    """
+                    DELETE FROM mutation_tree
+                    WHERE colony_id = $1 AND gene_id = $2
+                    """,
+                    colony_id,
+                    gene_id,
+                )
+
+        await invalidate_player_and_colony_cache(callback.from_user.id, player["id"])
+        await callback.message.edit_text("🗑️ Мутация удалена!")
+    except Exception as e:
+        logger.error(f"Error in remove_gene: {e}", exc_info=True)
+        await callback.message.answer("❌ Произошла ошибка при удалении мутации.")
 
 
 @router.message(Command("leaderboard"))
@@ -1432,6 +1883,12 @@ async def on_startup():
                 resource_exchange_rate FLOAT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )
+        """)
+
+        # Prevent duplicates regardless of direction (A<->B)
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_symbiosis_contracts_unique_pair
+            ON symbiosis_contracts (LEAST(host_id, symbiont_id), GREATEST(host_id, symbiont_id))
         """)
         
         await conn.execute("""
